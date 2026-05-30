@@ -1,0 +1,3 @@
+config/secrets.lua
+helpers/otc_query/node_modules/
+helpers/otc_query/package-lock.json

@@ -28,7 +28,7 @@ Auto-reload is on — any subsequent save to a `.lua` file under
 │   ├── window_management.lua      # Region placement + grow/shrink hotkeys
 │   ├── layouts.lua                # Layout presets + overlay toggles
 │   ├── minimize_layout.lua        # F19 toggle: hide current layout, surface the rest
-│   └── spaces.lua                 # ⌃⌥⌘ ←/→ desktop switching
+│   └── screens.lua                # ⌃⌥⌘ ←/→ move focused window between screens
 └── Spoons/                        # (not used yet; standard Hammerspoon plugin dir)
 ```
 
@@ -74,7 +74,10 @@ flagged `launch = true` auto-open.
 |---------------|-----------|-------------|
 | `⌃⌥⌘ pad1`    | `dev1`    | VSCode ¹⁄₃ · Ghostty ¹⁄₃ · Chrome for Testing (stacked) ¹⁄₃ |
 | `⌃⌥⌘ pad2`    | `dev2`    | VSCode ¹⁄₃ · Google Chrome ¹⁄₃ · Chrome for Testing (stacked) ¹⁄₃ |
-| `⌃⌥⌘ pad3`    | `meeting` | Google Chrome (Work profile) ¹⁄₂ · Google Meet ¹⁄₂ (auto-launches) |
+| `⌃⌥⌘ pad3`    | `dev3`    | VSCode ¹⁄₃ · Ghostty ¹⁄₃ · Google Chrome ¹⁄₃ |
+| `⌃⌥⌘ pad5`    | `meeting` | Google Chrome (Work profile) ¹⁄₂ · Google Meet ¹⁄₂ (auto-launches) |
+| `⌃⌥⌘ pad8`    | `browsing`| WhatsApp ¹⁄₄ · Google Chrome (Personal profile) center ¹⁄₂ |
+| `⌃⌥⌘ pad9`    | `pair-programming` | Google Chrome (Work profile) ¹⁄₂ · Ghostty ¹⁄₂ |
 
 Layout behavior:
 - **Clean slate**: applying a layout hides every running foreground app that
@@ -115,14 +118,16 @@ Centered "popup" — first press brings the app forward, second press hides it.
 
 Default size: 60% width × 83% height, centered.
 
-### Space switching (⌃⌥⌘)
+### Move window across screens (⌃⌥⌘)
 
-| Shortcut        | Action                |
-|-----------------|------------------------|
-| `⌃⌥⌘ →`         | Next desktop           |
-| `⌃⌥⌘ ←`         | Previous desktop       |
+| Shortcut        | Action                                 |
+|-----------------|-----------------------------------------|
+| `⌃⌥⌘ →`         | Move focused window to the next screen (rightward) |
+| `⌃⌥⌘ ←`         | Move focused window to the previous screen (leftward) |
 
-Uses `hs.spaces.gotoSpace` (not keystroke synthesis).
+Screens are sorted left-to-right by frame `x`, so the arrows match physical
+arrangement. No wrap — pressing `→` on the rightmost screen is a no-op. Window
+size is scaled proportionally on the new screen (`hs.window.moveToScreen`).
 
 ## Customizing
 

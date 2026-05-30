@@ -45,9 +45,34 @@ local layouts = {
     { app = "Google Chrome",             rect = { 1/3, 0, 1/3, 1 } },
     { app = "Google Chrome for Testing", rect = { 2/3, 0, 1/3, 1 }, stack = "vertical" },
   },
+  dev3 = {
+    { app = "Code",          rect = { 0,   0, 1/3, 1 } },
+    { app = "Ghostty",       rect = { 1/3, 0, 1/3, 1 } },
+    { app = "Google Chrome", rect = { 2/3, 0, 1/3, 1 } },
+  },
+  ["dev-claude"] = {
+    { app = "Claude",                    rect = { 0,   0, 2/3, 1 } },
+    { app = "Google Chrome for Testing", rect = { 2/3, 0, 1/3, 1 }, stack = "vertical" },
+  },
   meeting = {
     { app = "Google Chrome", rect = { 0, 0, 1/2, 1 }, prefer = { titlePattern = "%(Work%)$" } },
     { app = "Google Meet",   rect = { 1/2, 0, 1/2, 1 }, launch = true },
+  },
+  interview = {
+    { app = "Google Chrome", rect = { 0,   0,   1/2, 1/2 }, prefer = { titlePattern = "%(Work%)$" } },
+    { app = "Notion",        rect = { 0,   1/2, 1/2, 1/2 } },
+    { app = "Google Meet",   rect = { 1/2, 0,   1/2, 1   }, launch = true },
+  },
+  ["pair-programming"] = {
+    { app = "Google Chrome", rect = { 0,   0, 1/2, 1 }, prefer = { titlePattern = "%(Work%)$" } },
+    { app = "Ghostty",       rect = { 1/2, 0, 1/2, 1 } },
+  },
+  browsing = {
+    -- "\226\128\142" is U+200E (left-to-right mark). WhatsApp's Info.plist
+    -- sets CFBundleDisplayName to that invisible prefix + "WhatsApp", so
+    -- app:name() returns the prefixed string and a plain "WhatsApp" match fails.
+    { app = "\226\128\142WhatsApp", rect = { 0,   0, 1/4, 1 } },
+    { app = "Google Chrome",        rect = { 1/4, 0, 1/2, 1 }, prefer = { titlePattern = "%(Personal%)$" } },
   },
 }
 
@@ -55,12 +80,18 @@ local layouts = {
 local layoutBinds = {
   { key = "pad1", layout = "dev1" },
   { key = "pad2", layout = "dev2" },
-  { key = "pad3", layout = "meeting" },
+  { key = "pad3", layout = "dev3" },
+  { key = "pad4", layout = "dev-claude" },
+  { key = "pad5", layout = "meeting" },
+  { key = "pad7", layout = "pair-programming" },
+  { key = "pad8", layout = "browsing" },
+  { key = "pad9", layout = "interview" },
 }
 
 -- Centered popup overlays. width/height default to 3/5 × 5/6 if omitted.
 local overlays = {
-  { key = "pad0", app = "Slack" },
+  { key = "pad0",   app = "Slack" },
+  { key = "padenter", app = "Spotify" },
 }
 
 -- Precomputed set of app names covered by any layout or overlay. Exposed on
@@ -91,11 +122,13 @@ end
 -- Collect all "real" windows across any number of apps. allWindows() is used
 -- instead of visibleWindows() because the latter drops windows whose AX subrole
 -- isn't AXStandardWindow — which happens with Chromium-based apps.
+-- Windows on secondary displays (e.g. iPad via Sidecar) are excluded so the
+-- layout never repositions them.
 local function windowsOfAll(apps)
   local wins = {}
   for _, app in ipairs(apps) do
     for _, win in ipairs(app:allWindows()) do
-      if win:isStandard() and not win:isMinimized() then
+      if win:isStandard() and not win:isMinimized() and wm.isOnPrimary(win) then
         wins[#wins + 1] = win
       end
     end
@@ -158,7 +191,8 @@ local function reorderForLayout(layout, layoutApps, placed, zIndex, targetFront)
     end
   end
   for _, app in ipairs(hs.application.runningApplications()) do
-    if app:kind() == 1 and not layoutApps[app:name()] and not app:isHidden() then
+    if app:kind() == 1 and not layoutApps[app:name()] and not app:isHidden()
+        and not wm.appHasWindowOnSecondary(app) then
       local ids = byApp[app:name()]
       if ids and #ids > 0 then
         savedAppZOrder[app:name()] = ids
@@ -167,9 +201,11 @@ local function reorderForLayout(layout, layoutApps, placed, zIndex, targetFront)
   end
 
   -- Clean slate: hide every running foreground app that isn't part of this
-  -- layout. Leaves only layout apps visible.
+  -- layout. Apps with any window on a secondary display are left alone — hide
+  -- is all-or-nothing and would yank those windows off the secondary screen.
   for _, app in ipairs(hs.application.runningApplications()) do
-    if app:kind() == 1 and not layoutApps[app:name()] and not app:isHidden() then
+    if app:kind() == 1 and not layoutApps[app:name()] and not app:isHidden()
+        and not wm.appHasWindowOnSecondary(app) then
       app:hide()
     end
   end
@@ -197,9 +233,13 @@ local function reorderForLayout(layout, layoutApps, placed, zIndex, targetFront)
   end)
   for _, win in ipairs(placed) do win:raise() end
 
-  -- Activate layout apps so their windows sit above non-layout apps. Activate
-  -- the target app LAST so it ends up frontmost (regardless of its position
-  -- in the layout array).
+  -- Activate each layout app with the target last. We can't skip the
+  -- non-target activations even though it'd reduce jitter: on Electron apps
+  -- (VSCode, Chrome, etc.), win:raise()'s intra-app z-order change isn't
+  -- "committed" until the app is activated, so skipping causes the wrong
+  -- window to come forward when the user later focuses that app. Activating
+  -- in order with target last keeps target frontmost cross-app while still
+  -- committing each other app's intra-app z-order.
   local seen = {}
   local function activate(appName)
     for _, app in ipairs(findAppsExact(appName)) do
@@ -339,7 +379,15 @@ local function toggleOverlay(appName, width, height)
   height = height or 5/6
   local apps = findAppsExact(appName)
   if #apps > 0 and not apps[1]:isHidden() then
-    apps[1]:hide()
+    -- Only hide if this app is actually frontmost. If it's running but buried
+    -- behind another overlay (e.g. Slack covering Spotify), a press should
+    -- raise it rather than hide it — otherwise the user has to press twice.
+    local front = hs.application.frontmostApplication()
+    if front and front:pid() == apps[1]:pid() then
+      apps[1]:hide()
+      return
+    end
+    placeAppCentered(appName, width, height)
     return
   end
   if #apps == 0 then

@@ -2,9 +2,11 @@
 
 local modules = {
   "config.window_management",
-  "config.spaces",
+  "config.screens",
   "config.layouts",
   "config.minimize_layout",
+  "config.service_status",
+  "config.otc_codes",
 }
 
 -- Load each module in isolation so a syntax/runtime error in one doesn't

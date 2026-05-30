@@ -87,6 +87,32 @@ function M.placeWindow(win, x, y, w, h)
   }, placeAnimation)
 end
 
+-- True if `win` lives on the primary display (the one with the menu bar).
+-- Windows on secondary displays (e.g. an iPad via Sidecar) are excluded from
+-- layout placement and from hide passes — see config/layouts.lua and
+-- config/minimize_layout.lua.
+function M.isOnPrimary(win)
+  if not win then return false end
+  local s = win:screen()
+  local p = hs.screen.primaryScreen()
+  return s and p and s:id() == p:id()
+end
+
+-- True if `app` has any standard window on a non-primary display. Used to
+-- decide whether `app:hide()` is safe: hide affects all of an app's windows,
+-- so an app with any window on a secondary display is left alone.
+function M.appHasWindowOnSecondary(app)
+  local primary = hs.screen.primaryScreen()
+  if not primary then return false end
+  for _, win in ipairs(app:allWindows()) do
+    if win:isStandard() and not win:isMinimized() then
+      local s = win:screen()
+      if s and s:id() ~= primary:id() then return true end
+    end
+  end
+  return false
+end
+
 -- Hotkey callback: place the focused window into a fractional region.
 local function placeFocused(x, y, w, h)
   return function() M.placeWindow(hs.window.focusedWindow(), x, y, w, h) end

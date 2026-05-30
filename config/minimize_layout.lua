@@ -4,6 +4,7 @@
 -- to restore state.
 
 local layouts = require("config.layouts")
+local wm = require("config.window_management")
 
 local M = {}
 
@@ -28,7 +29,9 @@ local hotkey = "f19"
 local function hideHandled()
   local handledSet = layouts.handledSet
   for _, app in ipairs(hs.application.runningApplications()) do
-    if handledSet[app:name()] then
+    -- Skip apps with any window on a secondary display: app:hide() would
+    -- yank those windows off the secondary screen along with the primary ones.
+    if handledSet[app:name()] and not wm.appHasWindowOnSecondary(app) then
       app:hide()
     end
   end
@@ -57,7 +60,7 @@ local function surfaceOthers()
 
   -- First hide pass. `app:hide()` on the currently-frontmost app can silently
   -- race with focus transitions on modern macOS, which is why a second pass
-  -- runs below after the activate loop has moved focus elsewhere.
+  -- runs below after focus has moved elsewhere.
   hideHandled()
 
   -- Collect non-handled foreground apps that have at least one real window.
@@ -69,33 +72,31 @@ local function surfaceOthers()
     end
   end
 
-  -- Reverse-alphabetical so the alphabetically-first name ends up frontmost.
-  table.sort(apps, function(a, b) return a:name() > b:name() end)
-  -- If we remember which app was on top last time, move it to the end of the
-  -- list so it's activated LAST and ends up frontmost.
+  -- Decide target: remembered last-focused app if still present, otherwise
+  -- alphabetically first.
+  local target
   if lastFocused then
-    local target, rest = nil, {}
     for _, app in ipairs(apps) do
-      if app:name() == lastFocused then
-        target = app
-      else
-        rest[#rest + 1] = app
-      end
-    end
-    if target then
-      apps = rest
-      apps[#apps + 1] = target
+      if app:name() == lastFocused then target = app; break end
     end
   end
+  if not target then
+    table.sort(apps, function(a, b) return a:name() < b:name() end)
+    target = apps[1]
+  end
 
+  -- Unhide every non-handled app so its windows become visible, but DON'T
+  -- activate each one — activating N apps in sequence makes macOS animate N
+  -- menu-bar transitions, which is the main source of jitter. A single
+  -- activate on the target is enough.
   for _, app in ipairs(apps) do
     if app:isHidden() then app:unhide() end
-    app:activate(true)
   end
+  if target then target:activate(true) end
 
   -- Second hide pass catches any handled app that resisted hiding on the first
-  -- pass because it was the frontmost. By now the activate loop has moved
-  -- focus to a non-handled app, so the straggler can be safely hidden.
+  -- pass because it was the frontmost. By now focus has moved to the target,
+  -- so the straggler can be safely hidden.
   hideHandled()
 end
 

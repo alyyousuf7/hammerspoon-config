@@ -4,13 +4,12 @@
 -- to restore state.
 
 local layouts = require("config.layouts")
-local wm = require("config.window_management")
 
 local M = {}
 
--- Toggle state. Kept module-level and exposed on M below so the application
--- watcher and the hook registered on layouts aren't garbage-collected.
-local minimized = false
+-- Toggle state lives on `layouts` (layouts.minimized) so config/composer can see
+-- it: when a composer arrow is pressed while minimized, the composer restores the
+-- hidden composition instead of leaving it half-surfaced.
 -- Name of the last-focused non-layout app while minimized, so subsequent
 -- toggles restore the same top-of-stack.
 local lastFocused = nil
@@ -29,9 +28,7 @@ local hotkey = "f19"
 local function hideHandled()
   local handledSet = layouts.handledSet
   for _, app in ipairs(hs.application.runningApplications()) do
-    -- Skip apps with any window on a secondary display: app:hide() would
-    -- yank those windows off the secondary screen along with the primary ones.
-    if handledSet[app:name()] and not wm.appHasWindowOnSecondary(app) then
+    if handledSet[app:name()] then
       app:hide()
     end
   end
@@ -60,7 +57,7 @@ local function surfaceOthers()
 
   -- First hide pass. `app:hide()` on the currently-frontmost app can silently
   -- race with focus transitions on modern macOS, which is why a second pass
-  -- runs below after focus has moved elsewhere.
+  -- runs below after the activate loop has moved focus elsewhere.
   hideHandled()
 
   -- Collect non-handled foreground apps that have at least one real window.
@@ -72,42 +69,44 @@ local function surfaceOthers()
     end
   end
 
-  -- Decide target: remembered last-focused app if still present, otherwise
-  -- alphabetically first.
-  local target
+  -- Reverse-alphabetical so the alphabetically-first name ends up frontmost.
+  table.sort(apps, function(a, b) return a:name() > b:name() end)
+  -- If we remember which app was on top last time, move it to the end of the
+  -- list so it's activated LAST and ends up frontmost.
   if lastFocused then
+    local target, rest = nil, {}
     for _, app in ipairs(apps) do
-      if app:name() == lastFocused then target = app; break end
+      if app:name() == lastFocused then
+        target = app
+      else
+        rest[#rest + 1] = app
+      end
+    end
+    if target then
+      apps = rest
+      apps[#apps + 1] = target
     end
   end
-  if not target then
-    table.sort(apps, function(a, b) return a:name() < b:name() end)
-    target = apps[1]
-  end
 
-  -- Unhide every non-handled app so its windows become visible, but DON'T
-  -- activate each one — activating N apps in sequence makes macOS animate N
-  -- menu-bar transitions, which is the main source of jitter. A single
-  -- activate on the target is enough.
   for _, app in ipairs(apps) do
     if app:isHidden() then app:unhide() end
+    app:activate(true)
   end
-  if target then target:activate(true) end
 
   -- Second hide pass catches any handled app that resisted hiding on the first
-  -- pass because it was the frontmost. By now focus has moved to the target,
-  -- so the straggler can be safely hidden.
+  -- pass because it was the frontmost. By now the activate loop has moved
+  -- focus to a non-handled app, so the straggler can be safely hidden.
   hideHandled()
 end
 
 local function toggle()
-  if minimized then
+  if layouts.minimized then
     local current = layouts.currentLayout()
     if current then layouts.apply(current) end
-    minimized = false
+    layouts.minimized = false
   else
     surfaceOthers()
-    minimized = true
+    layouts.minimized = true
   end
 end
 
@@ -115,14 +114,16 @@ end
 -- restore the same top-of-stack on subsequent toggles.
 M.focusWatcher = hs.application.watcher.new(function(appName, eventType)
   if eventType ~= hs.application.watcher.activated then return end
-  if minimized and not layouts.handledSet[appName] then
+  if layouts.minimized and not layouts.handledSet[appName] then
     lastFocused = appName
   end
 end)
 
 -- A direct layout trigger exits minimized mode so the next toggle starts fresh.
+-- This also fires when the composer re-applies, which is what clears the flag
+-- after a composer arrow restores the composition.
 layouts.onApply = function()
-  minimized = false
+  layouts.minimized = false
 end
 
 -- ============================================================================

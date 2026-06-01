@@ -1,9 +1,13 @@
 -- Entry point. Each feature lives in its own file under config/.
 
+-- Command-line bridge: lets `hs -c "..."` drive this config from a terminal.
+require("hs.ipc")
+
 local modules = {
   "config.window_management",
   "config.screens",
   "config.layouts",
+  "config.composer",
   "config.minimize_layout",
   "config.service_status",
   "config.otc_codes",

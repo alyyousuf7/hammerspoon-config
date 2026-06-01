@@ -70,9 +70,15 @@ local resizes = {
 -- Move/resize a given window into a fractional region of its screen's usable
 -- frame. outerGap padding on edges touching screen bounds, innerGap/2 on inner
 -- edges (so two adjacent tiles sum to innerGap between them).
-function M.placeWindow(win, x, y, w, h)
+-- `dur` overrides the animation for this placement (e.g. 0 for instant); when
+-- omitted, placeAnimation is used.
+function M.placeWindow(win, x, y, w, h, dur)
   if not win then return end
-  local f = win:screen():frame()
+  -- A hidden window can report no screen; fall back to the primary so callers
+  -- (e.g. layouts.lua's pre-placement) can position a window before unhiding it.
+  local screen = win:screen() or hs.screen.primaryScreen()
+  if not screen then return end
+  local f = screen:frame()
   local eps = 1e-6
   local function pad(touchesEdge) return touchesEdge and outerGap or innerGap / 2 end
   local left   = pad(x         < eps)
@@ -84,7 +90,7 @@ function M.placeWindow(win, x, y, w, h)
     y = f.y + f.h * y + top,
     w = f.w * w - left - right,
     h = f.h * h - top  - bottom,
-  }, placeAnimation)
+  }, dur or placeAnimation)
 end
 
 -- True if `win` lives on the primary display (the one with the menu bar).

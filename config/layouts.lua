@@ -1,4 +1,8 @@
--- Named layout presets and centered overlay toggles.
+-- Window-placement engine + centered overlay toggles. Named presets used to
+-- live here; they've been replaced by config/composer.lua, which drives this
+-- file's apply()/applyDynamic() to place on-the-fly compositions. What remains:
+-- the placement/hide/raise/focus machinery, the Slack/Spotify overlays, and the
+-- helpers the composer calls (applyDynamic, focusEntry, hideOthers).
 -- Config lives at the top; logic in the middle; hotkey wiring at the bottom.
 
 local wm = require("config.window_management")
@@ -17,6 +21,10 @@ local pendingLaunches = {}
 -- front-to-back order. Restored when the app is unhidden by another layout.
 -- Stale IDs (after an app relaunch) are ignored during restore.
 local savedAppZOrder = {}
+-- Layout tables registered at runtime (e.g. by config/composer.lua) that have
+-- no static entry in `layouts`. Keyed by a synthetic name so they flow through
+-- the same apply()/minimize re-apply/last-focused machinery as named layouts.
+local dynamicLayouts = {}
 
 -- ============================================================================
 -- CONFIG
@@ -25,68 +33,19 @@ local savedAppZOrder = {}
 -- Modifier for every binding in this file.
 local mod = { "ctrl", "alt", "cmd" }
 
--- Layout definitions. Each entry: { app, rect = {x, y, w, h} in fractions, stack?, launch?, prefer? }
---   stack   = "vertical" to tile all windows of the app vertically in the rect.
---   launch  = true to open the app (non-blocking) if not already running.
---   prefer  = { titlePattern = "..." } — Lua pattern matched against each
---             window's AX title to pick a specific same-app window. For
---             Chrome, the AX title ends with the profile suffix (e.g.
---             " - Ali (Work)"), so `"%(Work%)$"` picks the Work-profile
---             window. Lua patterns differ from PCRE: escape magic chars
---             ( ) . % + - * ? [ ] ^ $ with a preceding `%`.
-local layouts = {
-  dev1 = {
-    { app = "Code",                      rect = { 0,   0, 1/3, 1 } },
-    { app = "Ghostty",                   rect = { 1/3, 0, 1/3, 1 } },
-    { app = "Google Chrome for Testing", rect = { 2/3, 0, 1/3, 1 }, stack = "vertical" },
-  },
-  dev2 = {
-    { app = "Code",                      rect = { 0,   0, 1/3, 1 } },
-    { app = "Google Chrome",             rect = { 1/3, 0, 1/3, 1 } },
-    { app = "Google Chrome for Testing", rect = { 2/3, 0, 1/3, 1 }, stack = "vertical" },
-  },
-  dev3 = {
-    { app = "Code",          rect = { 0,   0, 1/3, 1 } },
-    { app = "Ghostty",       rect = { 1/3, 0, 1/3, 1 } },
-    { app = "Google Chrome", rect = { 2/3, 0, 1/3, 1 } },
-  },
-  ["dev-claude"] = {
-    { app = "Claude",                    rect = { 0,   0, 2/3, 1 } },
-    { app = "Google Chrome for Testing", rect = { 2/3, 0, 1/3, 1 }, stack = "vertical" },
-  },
-  meeting = {
-    { app = "Google Chrome", rect = { 0, 0, 1/2, 1 }, prefer = { titlePattern = "%(Work%)$" } },
-    { app = "Google Meet",   rect = { 1/2, 0, 1/2, 1 }, launch = true },
-  },
-  interview = {
-    { app = "Google Chrome", rect = { 0,   0,   1/2, 1/2 }, prefer = { titlePattern = "%(Work%)$" } },
-    { app = "Notion",        rect = { 0,   1/2, 1/2, 1/2 } },
-    { app = "Google Meet",   rect = { 1/2, 0,   1/2, 1   }, launch = true },
-  },
-  ["pair-programming"] = {
-    { app = "Google Chrome", rect = { 0,   0, 1/2, 1 }, prefer = { titlePattern = "%(Work%)$" } },
-    { app = "Ghostty",       rect = { 1/2, 0, 1/2, 1 } },
-  },
-  browsing = {
-    -- "\226\128\142" is U+200E (left-to-right mark). WhatsApp's Info.plist
-    -- sets CFBundleDisplayName to that invisible prefix + "WhatsApp", so
-    -- app:name() returns the prefixed string and a plain "WhatsApp" match fails.
-    { app = "\226\128\142WhatsApp", rect = { 0,   0, 1/4, 1 } },
-    { app = "Google Chrome",        rect = { 1/4, 0, 1/2, 1 }, prefer = { titlePattern = "%(Personal%)$" } },
-  },
-}
-
--- Layout hotkey bindings.
-local layoutBinds = {
-  { key = "pad1", layout = "dev1" },
-  { key = "pad2", layout = "dev2" },
-  { key = "pad3", layout = "dev3" },
-  { key = "pad4", layout = "dev-claude" },
-  { key = "pad5", layout = "meeting" },
-  { key = "pad7", layout = "pair-programming" },
-  { key = "pad8", layout = "browsing" },
-  { key = "pad9", layout = "interview" },
-}
+-- Static named layouts have been retired in favour of config/composer.lua, which
+-- builds layout tables on the fly and applies them through M.applyDynamic. This
+-- table stays empty; getLayout() falls through to the dynamic registry.
+--
+-- Layout entry format (produced by the composer, consumed by apply()):
+--   { app, rect = {x, y, w, h} in fractions, stack?, launch?, prefer? }
+--     stack  = "vertical" to tile all of the app's windows down the rect.
+--     launch = true to open the app (non-blocking) if it isn't running.
+--     prefer = { titlePattern = "..." } — Lua pattern matched against a window's
+--              AX title to pick a specific same-app window (e.g. a Chrome
+--              profile, whose title ends in " … (Work)"). Lua patterns differ
+--              from PCRE: escape ( ) . % + - * ? [ ] ^ $ with a preceding `%`.
+local layouts = {}
 
 -- Centered popup overlays. width/height default to 3/5 × 5/6 if omitted.
 local overlays = {
@@ -94,12 +53,10 @@ local overlays = {
   { key = "padenter", app = "Spotify" },
 }
 
--- Precomputed set of app names covered by any layout or overlay. Exposed on
--- M so sibling modules (e.g. minimize_layout) don't need to recompute it.
+-- Set of app names the minimize toggle (config/minimize_layout) hides. Seeded
+-- with the overlay apps here; config/composer.lua adds its source apps at load.
+-- Exposed on M so sibling modules don't recompute it.
 local handledSet = {}
-for _, layout in pairs(layouts) do
-  for _, entry in ipairs(layout) do handledSet[entry.app] = true end
-end
 for _, o in ipairs(overlays) do handledSet[o.app] = true end
 M.handledSet = handledSet
 
@@ -139,6 +96,29 @@ end
 -- Place windows of one layout entry into its rect. Appends to `placedAcc` if given.
 -- `stack = "vertical"` slices the rect vertically across the windows;
 -- otherwise every window is placed at the full rect (z-stacked overlap).
+-- Resolve a layout table by name from either the static or dynamic registry.
+local function getLayout(name)
+  return layouts[name] or dynamicLayouts[name]
+end
+
+-- Narrow a window list to those whose AX title matches entry.prefer.titlePattern.
+-- Returns the original list unchanged if the entry has no prefer pattern, or if
+-- nothing matches (so a layout never ends up placing zero windows just because
+-- a profile window happens to be closed). This is what lets two same-app
+-- entries — e.g. Chrome (Work) and Chrome (Personal) — each claim only their
+-- own window instead of fighting over all of the app's windows.
+local function filterPreferred(wins, entry)
+  if not (entry.prefer and entry.prefer.titlePattern) then return wins end
+  local pattern = entry.prefer.titlePattern
+  local matched = {}
+  for _, win in ipairs(wins) do
+    local title = win:title()
+    if title and title:find(pattern) then matched[#matched + 1] = win end
+  end
+  if #matched > 0 then return matched end
+  return wins
+end
+
 local function placeEntry(wins, entry, placedAcc)
   local x, y, w, h = entry.rect[1], entry.rect[2], entry.rect[3], entry.rect[4]
   local vertical = entry.stack == "vertical"
@@ -257,20 +237,50 @@ local function reorderForLayout(layout, layoutApps, placed, zIndex, targetFront)
   activate(targetFront)
 end
 
+-- Position a hidden app's target window(s) to the entry rect BEFORE unhiding it,
+-- so the window reappears at its destination instead of flashing at its old
+-- position for a frame. Bypasses windowsOfAll's isStandard filter (hidden
+-- Chromium windows report a non-standard subrole), skips minimized and
+-- secondary-display windows, and matches the prefer pattern when present.
+-- Best-effort: any failure is swallowed so it can never break apply().
+local function preplaceHidden(app, entry)
+  local pattern = entry.prefer and entry.prefer.titlePattern
+  local primary = hs.screen.primaryScreen()
+  for _, win in ipairs(app:allWindows()) do
+    if not win:isMinimized() then
+      local s = win:screen()
+      local onPrimary = (not s) or (primary and s:id() == primary:id())
+      local t = win:title()
+      if onPrimary and ((not pattern) or (t and t:find(pattern))) then
+        pcall(function()
+          -- Always instant: the window must reach its rect before the unhide
+          -- reveals it, even when the composer is animating other placements.
+          wm.placeWindow(win, entry.rect[1], entry.rect[2], entry.rect[3], entry.rect[4], 0)
+        end)
+      end
+    end
+  end
+end
+
 local function apply(name)
-  local layout = layouts[name]
+  local layout = getLayout(name)
   if not layout then return end
   local missing = {}
   local placed = {}  -- all windows we positioned, in layout entry order
 
   -- Unhide layout apps that were hidden by a previous clean-slate or the F19
-  -- toggle. Intra-app z-order is restored later in the sort comparator, which
+  -- toggle. Each hidden app's target window is pre-positioned to its rect WHILE
+  -- still hidden (preplaceHidden), so it doesn't flash at its old position on
+  -- unhide. Intra-app z-order is restored later in the sort comparator, which
   -- uses savedAppZOrder as the source of truth (more reliable than raising
   -- immediately after unhide — those raises don't always stick before we
   -- capture orderedBefore).
   for _, entry in ipairs(layout) do
     for _, app in ipairs(findAppsExact(entry.app)) do
-      if app:isHidden() then app:unhide() end
+      if app:isHidden() then
+        preplaceHidden(app, entry)
+        app:unhide()
+      end
     end
   end
 
@@ -283,7 +293,7 @@ local function apply(name)
   for i, win in ipairs(orderedBefore) do zIndex[win:id()] = i end
 
   for _, entry in ipairs(layout) do
-    local wins = windowsOfAll(findAppsExact(entry.app))
+    local wins = filterPreferred(windowsOfAll(findAppsExact(entry.app)), entry)
     if #wins > 0 then
       placeEntry(wins, entry, placed)
     elseif entry.launch then
@@ -303,7 +313,11 @@ local function apply(name)
 
   local frontApp = hs.application.frontmostApplication()
   local frontName = frontApp and frontApp:name()
-  local targetFront = lastFocused[name]
+  -- Guard lastFocused with layoutApps: for dynamic compositions (config/
+  -- composer.lua) every arrangement reuses one layout name, so lastFocused can
+  -- name an app the current arrangement no longer contains. Without this guard,
+  -- the activate pass would resurrect that app — e.g. a slot you just emptied.
+  local targetFront = (lastFocused[name] and layoutApps[lastFocused[name]] and lastFocused[name])
     or (frontName and layoutApps[frontName] and frontName)
     or layout[1].app
 
@@ -413,7 +427,7 @@ end
 M.layoutFocusWatcher = hs.application.watcher.new(function(appName, eventType)
   if eventType ~= hs.application.watcher.activated then return end
   if not currentLayout then return end
-  local layout = layouts[currentLayout]
+  local layout = getLayout(currentLayout)
   if not layout then return end
   for _, entry in ipairs(layout) do
     if entry.app == appName then
@@ -427,18 +441,103 @@ end)
 -- WIRING
 -- ============================================================================
 
-for _, b in ipairs(layoutBinds) do
-  hs.hotkey.bind(mod, b.key, function() apply(b.layout) end)
-end
-
 for _, o in ipairs(overlays) do
   hs.hotkey.bind(mod, o.key, function() toggleOverlay(o.app, o.width, o.height) end)
 end
 
 M.layoutFocusWatcher:start()
 
--- Public API for sibling modules (e.g. config/minimize_layout).
+-- Public API for sibling modules (e.g. config/minimize_layout, config/composer).
 M.apply          = apply
 M.currentLayout  = function() return currentLayout end
+
+-- Shared "F19 minimize-toggle is active" flag. config/minimize_layout owns it
+-- (sets true when it surfaces other apps, false when it restores); config/
+-- composer reads it to know a focus move must restore the hidden composition.
+M.minimized      = false
+
+-- True if an app with this exact name currently has a usable window (standard,
+-- non-minimized, on the primary display). Apps the composer merely *hid* still
+-- count — hide doesn't drop their windows — so only quit/windowless apps read as
+-- absent. Used by the composer to decide whether a slot's app is still there.
+M.appHasWindows  = function(name) return #windowsOfAll(findAppsExact(name)) > 0 end
+
+-- Register a runtime-built layout table under `name` and apply it immediately.
+-- Used by config/composer.lua for on-the-fly compositions. The registration
+-- persists so currentLayout re-apply (minimize toggle) keeps working.
+M.applyDynamic = function(name, layoutTable)
+  dynamicLayouts[name] = layoutTable
+  apply(name)
+end
+
+-- Hide every foreground app whose name isn't in `keep` (a set of app names),
+-- so empty slots reveal the desktop instead of whatever window happened to sit
+-- behind. Skips apps with a window on a secondary display (hide is all-or-nothing).
+-- Unlike apply()'s reorder, this is unconditional — it isn't subject to the
+-- skip-optimization — which is what the composer wants on every move.
+M.hideOthers = function(keep)
+  -- Cancel any in-flight clean-slate retry — this call supersedes it, and a stale
+  -- retry could otherwise hide an app the new layout wants visible.
+  if M._cleanSlateRetry then M._cleanSlateRetry:stop(); M._cleanSlateRetry = nil end
+  -- A foreground app (other than Finder, which just backs the desktop) that
+  -- should be hidden but isn't yet.
+  local function visibleStraggler()
+    for _, app in ipairs(hs.application.runningApplications()) do
+      local name = app:name()
+      if app:kind() == 1 and name ~= "Finder" and not keep[name]
+          and not app:isHidden() and not wm.appHasWindowOnSecondary(app) then
+        return true
+      end
+    end
+    return false
+  end
+  local function pass(extraKeep)
+    for _, app in ipairs(hs.application.runningApplications()) do
+      local name = app:name()
+      if app:kind() == 1 and not keep[name] and not (extraKeep and extraKeep[name])
+          and not app:isHidden() and not wm.appHasWindowOnSecondary(app) then
+        app:hide()
+      end
+    end
+  end
+
+  if next(keep) ~= nil then
+    pass()        -- normal move: a slot app stays frontmost, so just hide the rest
+    return
+  end
+
+  -- Clean slate (nothing kept): KEEP Finder visible as the desktop's backer.
+  -- macOS auto-resurfaces a hidden app when no foreground app is left, so hiding
+  -- Finder too would flash VSCode/etc back in — keeping Finder up prevents that.
+  local needsEscalation = visibleStraggler()   -- snapshot before async hides
+  pass({ Finder = true })
+  if not needsEscalation then return end        -- already clean → no activate, no flash
+
+  -- A real app was visible and the frontmost one can silently ignore hide() (a
+  -- known macOS race). Surface the desktop only if Finder isn't already front
+  -- (avoids a redundant activation flash), then re-hide stubborn stragglers until
+  -- only Finder remains, capped so we never loop forever.
+  local front = hs.application.frontmostApplication()
+  if not (front and front:name() == "Finder") then
+    local finder = hs.application.get("Finder")
+    if finder then finder:activate() end
+  end
+  local tries = 0
+  local function retry()
+    tries = tries + 1
+    pass({ Finder = true })
+    if visibleStraggler() and tries < 6 then
+      M._cleanSlateRetry = hs.timer.doAfter(0.1, retry)
+    end
+  end
+  M._cleanSlateRetry = hs.timer.doAfter(0.06, retry)
+end
+
+-- Bring an entry's app to the front WITHOUT forcing a specific window, so the
+-- window the user left on top (e.g. via Cmd-`) stays on top — apply() has
+-- already restored the app's intra-app z-order before this runs.
+M.focusEntry = function(entry)
+  for _, app in ipairs(findAppsExact(entry.app)) do app:activate(true) end
+end
 
 return M

@@ -39,5 +39,9 @@ end
 -- WIRING
 -- ============================================================================
 
-hs.hotkey.bind(mod, "right", moveWindow(1))
-hs.hotkey.bind(mod, "left",  moveWindow(-1))
+-- Shift is part of the combo so the bare ⌃⌥⌘+←/→ arrows are free for
+-- config/composer.lua's quick-swap (which maps left/middle/right slots to
+-- ←/↓/→). Moving a window across displays is ⌃⌥⌘+Shift+←/→.
+local moveMod = { "ctrl", "alt", "cmd", "shift" }
+hs.hotkey.bind(moveMod, "right", moveWindow(1))
+hs.hotkey.bind(moveMod, "left",  moveWindow(-1))

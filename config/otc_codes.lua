@@ -1,7 +1,8 @@
 -- Floating panel that lists recent one-time codes (OTCs) from the local
--- `email_tokens` table. Polls every few seconds, shows up to 10 codes from
--- the last 30 minutes, click a row to copy the code to the clipboard.
--- Hides itself entirely when there are no recent codes.
+-- `email_tokens` table. A long-lived helper polls MySQL every few seconds and
+-- streams results; the panel shows up to 10 codes from the last 15 minutes,
+-- click a row to copy the code to the clipboard. Hides itself entirely when
+-- there are no recent codes.
 
 local secrets = require("config.secrets")
 local m = secrets.mysql
@@ -10,10 +11,12 @@ local m = secrets.mysql
 -- CONFIG
 -- ============================================================================
 
-local NODE_BIN    = os.getenv("HOME") .. "/.local/share/fnm/aliases/default/bin/node"
-local QUERY_JS    = os.getenv("HOME") .. "/.hammerspoon/helpers/otc_query/query.js"
-local POLL_SECS   = 5
-local REFRESH_SECS = 5     -- re-render relative timestamps without re-querying
+-- Long-lived Go poller (helpers/otc_query): holds one MySQL connection and
+-- prints a JSON line per poll. Self-contained static binary — no node runtime,
+-- no node_modules. Rebuild: cd helpers/otc_query && go build -ldflags="-s -w" -o otc_query .
+local OTC_BIN     = os.getenv("HOME") .. "/.hammerspoon/helpers/otc_query/otc_query"
+local POLL_SECS   = 1      -- helper query cadence AND panel re-render cadence
+local FLASH_SECS  = 5      -- how long the "Copied" flash holds after a row click
 local MAX_ROWS    = 10
 local PANEL_W     = 360
 local ROW_H       = 52
@@ -26,12 +29,13 @@ local CORNER_GAP  = 8      -- distance from screen edges
 -- ============================================================================
 
 local rawRows = {}         -- list of { token, email, created_ts } from DB
-local canvas = nil
+local canvas = nil         -- ONE persistent canvas, reused across renders
+local currentRows = {}     -- rows currently drawn, for the (persistent) click handler
 local lastFlash = nil      -- { token, until_ts } — show "Copied!" briefly
 
 -- Dismissed tokens persist across reloads so a row stays hidden as long as it
 -- might still show up in DB results. Map: token -> expiry_ts (when we'll
--- purge it). We keep dismissals for 1h — well past the 30m query window.
+-- purge it). We keep dismissals for 1h — well past the 15m query window.
 local DISMISS_KEY  = "otcCodes.dismissed.v1"
 local DISMISS_TTL  = 3600
 local dismissed = hs.settings.get(DISMISS_KEY) or {}
@@ -78,13 +82,51 @@ end
 -- RENDER
 -- ============================================================================
 
-local function render()
+local render   -- forward decl (the click handler below calls it)
+
+-- Build the persistent canvas ONCE and wire its click handler. Earlier this
+-- module deleted and recreated the canvas on every render (every ~5s, on both
+-- poll and refresh) — ~17k NSView/CALayer alloc-frees/day, whose backing stores
+-- hs.canvas doesn't promptly release, which is what grew Hammerspoon's RSS into
+-- the multiple-GB range over weeks. Now we keep one canvas and only swap its
+-- elements / move its frame; it's hidden (not destroyed) when there are no rows.
+-- The handler reads the module-level `currentRows` rather than a per-render
+-- capture, so it stays valid for the life of the single canvas.
+local function ensureCanvas()
+  if canvas then return end
+  canvas = hs.canvas.new({ x = 0, y = 0, w = PANEL_W, h = HEADER_H + PADDING * 2 })
+  canvas:level(hs.canvas.windowLevels.popUpMenu)
+  canvas:behavior({ "canJoinAllSpaces", "stationary" })
+  canvas:clickActivating(false)
+  canvas:mouseCallback(function(_, evt, id)
+    if evt ~= "mouseUp" then return end
+    local s = tostring(id)
+    local xIdx = tonumber(s:match("^x%-(%d+)$"))
+    if xIdx then
+      local row = currentRows[xIdx]; if not row then return end
+      dismissed[row.token] = os.time() + DISMISS_TTL
+      hs.settings.set(DISMISS_KEY, dismissed)
+      render()
+      return
+    end
+    local idx = tonumber(s:match("^row%-(%d+)$"))
+    if not idx then return end
+    local row = currentRows[idx]; if not row then return end
+    hs.pasteboard.setContents(row.token)
+    lastFlash = { token = row.token, until_ts = os.time() + FLASH_SECS }
+    render()
+  end)
+  canvas:canvasMouseEvents(true, true)
+end
+
+render = function()
   -- Drop the "Copied!" flash once expired.
   if lastFlash and os.time() > lastFlash.until_ts then lastFlash = nil end
 
   local rows = visibleRows()
+  currentRows = rows
   if #rows == 0 then
-    if canvas then canvas:delete(); canvas = nil end
+    if canvas then canvas:hide() end   -- keep the canvas; just hide it
     return
   end
 
@@ -95,12 +137,6 @@ local function render()
   local screen = hs.screen.primaryScreen():frame()
   local x = screen.x + screen.w - PANEL_W - CORNER_GAP
   local y = screen.y + screen.h - h - CORNER_GAP
-
-  if canvas then canvas:delete() end
-  canvas = hs.canvas.new({ x = x, y = y, w = PANEL_W, h = h })
-  canvas:level(hs.canvas.windowLevels.popUpMenu)
-  canvas:behavior({ "canJoinAllSpaces", "stationary" })
-  canvas:clickActivating(false)
 
   local elements = {
     -- Background
@@ -176,26 +212,9 @@ local function render()
     })
   end
 
-  canvas:replaceElements(elements)
-  canvas:mouseCallback(function(_, evt, id)
-    if evt ~= "mouseUp" then return end
-    local s = tostring(id)
-    local xIdx = tonumber(s:match("^x%-(%d+)$"))
-    if xIdx then
-      local row = rows[xIdx]; if not row then return end
-      dismissed[row.token] = os.time() + DISMISS_TTL
-      hs.settings.set(DISMISS_KEY, dismissed)
-      render()
-      return
-    end
-    local idx = tonumber(s:match("^row%-(%d+)$"))
-    if not idx then return end
-    local row = rows[idx]; if not row then return end
-    hs.pasteboard.setContents(row.token)
-    lastFlash = { token = row.token, until_ts = os.time() + 1 }
-    render()
-  end)
-  canvas:canvasMouseEvents(true, true)
+  ensureCanvas()
+  canvas:frame({ x = x, y = y, w = PANEL_W, h = h })   -- reposition/resize, no realloc
+  canvas:replaceElements(elements)                      -- swap content in place
   canvas:show()
 end
 
@@ -204,9 +223,9 @@ end
 -- ----------------------------------------------------------------------------
 -- The helper is launched ONCE as a long-lived process; it queries MySQL on
 -- its own POLL_SECS interval and prints one JSON line per result. We consume
--- those lines via streamingCallback. Earlier versions forked node every 5s
--- (~17k spawns/day), which caused multi-GB heap growth in Hammerspoon over
--- weeks of uptime.
+-- those lines via streamingCallback. (A much earlier version forked a fresh
+-- process every 5s; that churn — plus the canvas churn fixed above — is what
+-- caused multi-GB heap growth in Hammerspoon over weeks of uptime.)
 -- ============================================================================
 
 local function applyLine(line)
@@ -215,7 +234,7 @@ local function applyLine(line)
   if not ok or type(decoded) ~= "table" or not decoded.ok then return end
   local new = {}
   for _, r in ipairs(decoded.rows or {}) do
-    local ts = tonumber(r.created_ts)   -- mysql2 may return decimal as string
+    local ts = tonumber(r.created_ts)   -- may arrive as number or string
     if r.token and r.email and ts then
       table.insert(new, { token = tostring(r.token), email = tostring(r.email), created_ts = math.floor(ts) })
     end
@@ -225,7 +244,7 @@ local function applyLine(line)
   render()
 end
 
--- Stream buffer: node may flush partial lines; accumulate until we see \n.
+-- Stream buffer: the helper may flush partial lines; accumulate until we see \n.
 local stdoutBuf = ""
 
 local function onStdout(_, chunk)
@@ -246,14 +265,13 @@ local otcTask = nil
 local function startHelper()
   if otcTask and otcTask:isRunning() then return end
   stdoutBuf = ""
-  otcTask = hs.task.new(NODE_BIN, function(_exit, _out, _err)
+  otcTask = hs.task.new(OTC_BIN, function(_exit, _out, _err)
     -- Exit callback: helper died. Don't auto-restart in a tight loop — let
     -- the wake watcher or next reload bring it back. Most exits here are
     -- intentional (Hammerspoon reload sends SIGTERM).
     otcTask = nil
-  end, onStdout, { QUERY_JS })
+  end, onStdout)   -- no args; the binary reads everything from the environment
   otcTask:setEnvironment({
-    PATH          = "/usr/bin:/bin:/usr/local/bin",
     MYSQL_HOST    = m.host, MYSQL_PORT = m.port, MYSQL_USER = m.user,
     MYSQL_PASS    = m.pass, MYSQL_DB   = m.db,
     OTC_POLL_SECS = tostring(POLL_SECS),
@@ -263,11 +281,11 @@ end
 
 -- Globals: see init.lua / service_status.lua for why top-level locals would
 -- be reclaimed and break the timers.
-otcCodesRefreshTimer = hs.timer.doEvery(REFRESH_SECS, render)
+otcCodesRefreshTimer = hs.timer.doEvery(POLL_SECS, render)
 otcCodesWakeWatcher  = hs.caffeinate.watcher.new(function(event)
   local w = hs.caffeinate.watcher
   if event == w.systemDidWake or event == w.screensDidUnlock or event == w.screensDidWake then
-    -- Helper's setInterval pauses during sleep on some macOS versions;
+    -- Helper's interval pauses during sleep on some macOS versions;
     -- restart it on wake to guarantee fresh data.
     if otcTask then otcTask:terminate() end
     otcTask = nil

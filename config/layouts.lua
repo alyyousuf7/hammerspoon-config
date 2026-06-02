@@ -540,4 +540,15 @@ M.focusEntry = function(entry)
   for _, app in ipairs(findAppsExact(entry.app)) do app:activate(true) end
 end
 
+-- Re-tile all of one entry's app windows into its rect — the same placement
+-- apply() uses, exposed for config/composer's window-created watcher so a window
+-- opened AFTER a composition is applied snaps into its slot instead of floating.
+-- Honors vertical stacking and prefer patterns; a no-op if the app has no usable
+-- (standard, non-minimized, primary-display) window. Never raises/activates — it
+-- only sets frames, so the just-opened window keeps its natural focus.
+M.retileApp = function(entry)
+  local wins = filterPreferred(windowsOfAll(findAppsExact(entry.app)), entry)
+  if #wins > 0 then placeEntry(wins, entry) end
+end
+
 return M

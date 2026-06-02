@@ -1096,6 +1096,42 @@ M.mouseSideTap = hs.eventtap.new(
   end)
 M.mouseSideTap:start()
 
+-- Auto-retile: when a window OPENS or CLOSES for an app that's assigned to a
+-- currently VISIBLE slot, re-tile that slot from the app's live window list — so a
+-- window opened after the layout was applied joins its slot's stack instead of
+-- floating, and a closed window lets the survivors re-slice to fill the gap
+-- (matters most for the vertical-stack slot, e.g. Chrome for Testing). Pure
+-- placement: it only re-tiles, never touching focus/state/overlays. Skipped while
+-- F19-minimized (the composition isn't on screen) and for hidden slots (no
+-- on-screen rect — the window is tiled when the geometry next reveals the slot).
+-- Re-tiling targets the SAME rect the composer's own apply/launch would, so any
+-- overlap (e.g. a preset recall launching the app) is an invisible no-op. Standard
+-- + primary-display filtering falls out of windowsOfAll inside retileApp, and the
+-- last window closing leaves zero windows → retileApp no-ops (the now-empty slot
+-- collapses on the next composer action via pruneDeadSlots).
+local function slotForApp(appName)
+  for i = 1, 3 do
+    if slots[i] and slots[i].app == appName then return i end
+  end
+  return nil
+end
+
+local function retileSlotForApp(_, appName)
+  if layouts.minimized then return end
+  local i = slotForApp(appName)
+  if not i then return end
+  local c = cells()[i]
+  if not c then return end   -- slot hidden by the current geometry → leave the windows
+  layouts.retileApp({ app = slots[i].app, rect = { c[1], 0, c[2], 1 }, stack = slots[i].stack })
+end
+
+local watchedApps = {}
+for _, s in ipairs(sources) do watchedApps[#watchedApps + 1] = s.app end
+M.newWindowFilter = hs.window.filter.new(watchedApps)
+M.newWindowFilter:subscribe(
+  { hs.window.filter.windowCreated, hs.window.filter.windowDestroyed },
+  retileSlotForApp)
+
 -- Pin/unpin the minimap (stays up until 'm' again or an arrow nav un-pins it).
 hs.hotkey.bind(mod, "m", toggleMinimap)
 

@@ -504,6 +504,91 @@ local function flashSlotBounds(onlyFocus)
 end
 
 -- ---------------------------------------------------------------------------
+-- Spotlight (focus mode): dim the whole screen except the focused slot so the
+-- focused app stands out. Toggled with ⌃⌥⌘+F; while on, the hole follows the
+-- focus cursor (redrawn from commit/recall/newLayout). One reused canvas, sits
+-- just below the other overlays, and has no mouse callback so it's fully
+-- click-through — the dimmed apps stay usable, it's purely visual.
+-- ---------------------------------------------------------------------------
+local SPOT_DIM = 0.5      -- darkness of the dimmed area (black alpha)
+
+local function clearSpotlight()
+  if M.spotlight then M.spotlight:delete(FADE_OUT); M.spotlight = nil end
+end
+
+local function drawSpotlight()
+  if layouts.minimized then clearSpotlight(); return end   -- composition not on screen
+  local cell = cells()[focus]
+  if not cell then clearSpotlight(); return end
+  local f = hs.screen.primaryScreen():frame()
+  local outerGap, innerGap, eps = 8, 8, 1e-6
+  local function pad(touchesEdge) return touchesEdge and outerGap or innerGap / 2 end
+  local x, w = cell[1], cell[2]
+  local rx = f.w * x + pad(x < eps)
+  local rw = f.w * w - pad(x < eps) - pad(x + w > 1 - eps)
+  local ry, rh = outerGap, f.h - outerGap * 2
+  local accent = ACCENT
+  local els = {
+    -- Dim the whole screen.
+    { type = "rectangle", action = "fill", fillColor = { white = 0, alpha = SPOT_DIM },
+      frame = { x = 0, y = 0, w = f.w, h = f.h } },
+    -- Punch a transparent hole over the focused slot.
+    { type = "rectangle", action = "fill", fillColor = { white = 1, alpha = 1 },
+      compositeRule = "clear",
+      frame = { x = rx, y = ry, w = rw, h = rh }, roundedRectRadii = { xRadius = 14, yRadius = 14 } },
+    -- Accent rim around the hole.
+    { type = "rectangle", action = "stroke", strokeColor = withAlpha(accent, 0.9), strokeWidth = 3,
+      frame = { x = rx, y = ry, w = rw, h = rh }, roundedRectRadii = { xRadius = 14, yRadius = 14 } },
+  }
+  if M.spotlight then
+    M.spotlight:replaceElements(els)          -- reuse: instant move, no re-fade
+  else
+    local cv = hs.canvas.new({ x = f.x, y = f.y, w = f.w, h = f.h })
+    cv:level(hs.canvas.windowLevels.popUpMenu - 2)   -- above windows, below the other overlays
+    cv:behavior({ "canJoinAllSpaces", "stationary" })
+    cv:clickActivating(false)                 -- no mouse callback → click-through
+    cv:replaceElements(els)
+    cv:show(FADE_IN)
+    M.spotlight = cv
+  end
+end
+
+-- Whether the dim is currently suppressed because focus is on something that
+-- isn't a composed slot — another app, or a floating panel like Ghostty's
+-- quick-terminal (an AXFloatingWindow). Tracked apart from M.spotlightOn (the
+-- armed mode): the mode stays on; only the dim's visibility flips.
+local spotHidden = false
+
+-- Hide or restore the dim from whatever window has focus RIGHT NOW. Driven by the
+-- activation watcher (instant on app switches) and a low-rate poll (catches focus
+-- changes that fire no app-activation event — notably opening the quick-terminal
+-- while Ghostty is already frontmost). Only flips visibility; the hole's slot is
+-- the focus cursor (kept current by the watcher), so this never fights nav.
+local function refreshSpotlight()
+  if not M.spotlightOn or layouts.minimized then return end
+  local fw = hs.window.focusedWindow()
+  local app = fw and fw:application() and fw:application():name()
+  local onSlot = false
+  if fw and fw:isStandard() and app then
+    for i = 1, 3 do
+      if cells()[i] and slots[i] and slots[i].app == app then onSlot = true; break end
+    end
+  end
+  if onSlot and spotHidden then
+    spotHidden = false; drawSpotlight()
+  elseif (not onSlot) and not spotHidden then
+    spotHidden = true; clearSpotlight()
+  end
+end
+
+local function toggleSpotlight()
+  if layouts.minimized then return end   -- focus mode is disallowed while F19-minimized
+  M.spotlightOn = not M.spotlightOn
+  spotHidden = false
+  if M.spotlightOn then drawSpotlight() else clearSpotlight() end
+end
+
+-- ---------------------------------------------------------------------------
 -- Apply the current (v, h, slots) to the screen.
 -- ---------------------------------------------------------------------------
 
@@ -596,6 +681,7 @@ local function commit(changed, focusFlashOnly)
   -- a focus-only move (or when the caller forces it) — then fade.
   flashSlotBounds(focusFlashOnly or not changed)
   drawMinimap()
+  if M.spotlightOn and not spotHidden then drawSpotlight() end
   persistState()
 end
 
@@ -902,7 +988,7 @@ local function drawPresetPanel(sel)
 end
 
 local function doSave(id)
-  savedPresets[id] = { v = v, h = h, sourceNames = currentSourceNames() }
+  savedPresets[id] = { v = v, h = h, sourceNames = currentSourceNames(), spotlight = M.spotlightOn or false }
   hs.settings.set(SETTINGS_KEY, savedPresets)
   dismissPresetPanel()
   hs.alert.show("Saved as Preset " .. id)
@@ -942,6 +1028,7 @@ local function newLayout()
   applyComposition()   -- empty slots → clean slate (hides everything)
   flashSlotBounds()    -- show the fresh thirds even though all slots are empty
   drawMinimap()
+  if M.spotlightOn and not spotHidden then drawSpotlight() end
   persistState()
 end
 
@@ -1011,8 +1098,13 @@ local function recall(id, silent)
   applyComposition(true)   -- preset recall is the only path allowed to launch closed apps
   local src = slots[focus]
   if cells()[focus] and src then layouts.focusEntry({ app = src.app, prefer = src.prefer }) end
+  -- Restore the preset's focus-mode (spotlight) state.
+  M.spotlightOn = p.spotlight or false
+  spotHidden = false
+  if M.spotlightOn then drawSpotlight() else clearSpotlight() end
   flashSlotBounds()        -- always outline the applied layout, even if the shape is unchanged
   if not silent then drawMinimap() end
+  if M.spotlightOn and not spotHidden then drawSpotlight() end
   persistState()
 end
 
@@ -1134,6 +1226,36 @@ M.newWindowFilter:subscribe(
 
 -- Pin/unpin the minimap (stays up until 'm' again or an arrow nav un-pins it).
 hs.hotkey.bind(mod, "m", toggleMinimap)
+
+-- Spotlight/focus mode: dim everything but the focused slot.
+hs.hotkey.bind(mod, "f", toggleSpotlight)
+
+-- Keep the focus cursor in sync with MANUAL focus changes: when you click or
+-- Cmd-Tab to an app that lives in a visible slot, move the cursor there — so
+-- ⌃⌥⌘←/→ and the spotlight navigate from where you actually are, not from
+-- wherever the composer last parked the cursor. The composer's own moves always
+-- activate the focused slot's app LAST, so this stays consistent during nav too;
+-- activating a non-slot app is ignored (the cursor stays put).
+M.focusSyncWatcher = hs.application.watcher.new(function(appName, eventType)
+  if eventType ~= hs.application.watcher.activated then return end
+  local slot
+  for i = 1, 3 do
+    if cells()[i] and slots[i] and slots[i].app == appName then slot = i; break end
+  end
+  if slot then focus = slot end          -- keep the nav cursor on the focused slot
+  if not M.spotlightOn then return end
+  if slot then
+    spotHidden = false; drawSpotlight()  -- move/show the hole onto the activated slot
+  else
+    spotHidden = true; clearSpotlight()  -- activated a non-slot app → hide the dim
+  end
+end)
+M.focusSyncWatcher:start()
+
+-- Low-rate poll so the dim reacts to focus changes that emit NO app-activation
+-- event — chiefly opening Ghostty's quick-terminal (a floating window inside the
+-- already-frontmost Ghostty). No-ops instantly while focus mode is off.
+M.spotlightPoll = hs.timer.doEvery(0.3, refreshSpotlight)
 
 -- Jump straight to a fresh empty thirds (same as the panel's "New layout" row).
 hs.hotkey.bind(mod, "n", newLayout)

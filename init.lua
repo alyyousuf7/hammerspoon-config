@@ -9,8 +9,11 @@ local modules = {
   "config.layouts",
   "config.composer",
   "config.minimize_layout",
+  "config.notifier",
   "config.service_status",
+  "config.bm_tradein_status",
   "config.otc_codes",
+  "config.settings_watch",
 }
 
 -- Load each module in isolation so a syntax/runtime error in one doesn't

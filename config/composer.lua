@@ -21,6 +21,7 @@
 
 local layouts = require("config.layouts")
 local wm = require("config.window_management")
+local theme = require("config.theme")
 
 local M = {}
 
@@ -181,13 +182,14 @@ end
 -- (boxes + numbers) for that state; the current state is highlighted, and
 -- within it the focused slot is marked. Auto-fades like the flash.
 -- ---------------------------------------------------------------------------
-local ACCENT = { red = 0.0, green = 0.478, blue = 1.0, alpha = 1 }   -- macOS system accent blue (#007AFF)
-local function withAlpha(co, a) return { red = co.red, green = co.green, blue = co.blue, alpha = a } end
+-- Palette/material now live in config.theme (shared with the notifier pills).
+local ACCENT = theme.ACCENT                                 -- macOS system accent blue (#007AFF)
+local withAlpha = theme.withAlpha
 
 -- Fade durations (seconds) for the three overlays. Fades happen only on
 -- first-appear / disappear; a redraw of an already-visible overlay reuses its
 -- canvas (instant content swap) so rapid nav/cycle never flickers.
-local FADE_IN, FADE_OUT = 0.12, 0.18
+local FADE_IN, FADE_OUT = theme.FADE_IN, theme.FADE_OUT
 
 -- Shared mini layout-node renderer, used by both the minimap and the preset
 -- panel so the two show the *same* slot-diagram visual. Draws the node container
@@ -274,11 +276,10 @@ local function drawMinimap(pinned)
   -- translucent dark "HUD" material with a large soft window shadow and a hairline
   -- top-light edge. (hs.canvas can't truly backdrop-blur, so the wallpaper
   -- bleed-through is a tasteful translucency rather than real vibrancy.)
-  local panelFill = { white = 0.10, alpha = 0.92 }   -- Cmd-Tab charcoal vibrancy
   local els = { { type = "rectangle", action = "strokeAndFill",
-    fillColor = panelFill,
-    strokeColor = { white = 1, alpha = 0.18 }, strokeWidth = 1,
-    shadow = { blurRadius = 32, color = { alpha = 0.55 }, offset = { h = -11, w = 0 } },
+    fillColor = theme.PANEL_FILL,
+    strokeColor = theme.HAIRLINE, strokeWidth = 1,
+    shadow = theme.SHADOW,
     frame = { x = MARGIN, y = MARGIN, w = panelW, h = panelH },
     roundedRectRadii = { xRadius = 22, yRadius = 22 } } }
 
@@ -375,9 +376,9 @@ local function drawAppSwitcher(list, chosenName, disabled)
   local oy = f.y + (f.h - H) / 2
 
   local els = { { type = "rectangle", action = "strokeAndFill",
-    fillColor = { white = 0.10, alpha = 0.92 },
-    strokeColor = { white = 1, alpha = 0.18 }, strokeWidth = 1,
-    shadow = { blurRadius = 32, color = { alpha = 0.55 }, offset = { h = -11, w = 0 } },
+    fillColor = theme.PANEL_FILL,
+    strokeColor = theme.HAIRLINE, strokeWidth = 1,
+    shadow = theme.SHADOW,
     frame = { x = MARGIN, y = MARGIN, w = panelW, h = panelH },
     roundedRectRadii = { xRadius = 20, yRadius = 20 } } }
 
@@ -521,12 +522,26 @@ local function drawSpotlight()
   local cell = cells()[focus]
   if not cell then clearSpotlight(); return end
   local f = hs.screen.primaryScreen():frame()
-  local outerGap, innerGap, eps = 8, 8, 1e-6
-  local function pad(touchesEdge) return touchesEdge and outerGap or innerGap / 2 end
-  local x, w = cell[1], cell[2]
-  local rx = f.w * x + pad(x < eps)
-  local rw = f.w * w - pad(x < eps) - pad(x + w > 1 - eps)
-  local ry, rh = outerGap, f.h - outerGap * 2
+  -- Hole = the focused window's REAL frame when we can find it (so manual
+  -- resize/move/drag is reflected), else the slot's tiled geometry (empty slot,
+  -- focus on a non-slot window, or a secondary display).
+  local rx, ry, rw, rh
+  local src = slots[focus]
+  local fw = src and hs.window.focusedWindow() or nil
+  local fa = fw and fw:application()
+  if fw and fw:isStandard() and fa and fa:name() == src.app and wm.isOnPrimary(fw) then
+    local fr = fw:frame()
+    -- Hole sits exactly on the window frame (no halo) — windows are placed with
+    -- the same gap the flash insets by, so this matches the flash's padding/radius.
+    rx, ry, rw, rh = fr.x - f.x, fr.y - f.y, fr.w, fr.h
+  else
+    local outerGap, innerGap, eps = 8, 8, 1e-6
+    local function pad(touchesEdge) return touchesEdge and outerGap or innerGap / 2 end
+    local x, w = cell[1], cell[2]
+    rx = f.w * x + pad(x < eps)
+    rw = f.w * w - pad(x < eps) - pad(x + w > 1 - eps)
+    ry, rh = outerGap, f.h - outerGap * 2
+  end
   local accent = ACCENT
   local els = {
     -- Dim the whole screen.
@@ -661,7 +676,21 @@ local dismissPresetPanel   -- forward decl; assigned in the preset-panel section
 -- apps, so it's flicker-free.
 -- focusFlashOnly: flash only the focused slot's bounds even on a shape change
 -- (used by rotate, where the geometry is unchanged but assignments move).
+-- Briefly mute the focus-sync watcher around composer-driven moves. As the
+-- composer tiles, it activates apps (e.g. cycling a slot to empty surfaces
+-- another slot's app); without this the watcher would read those activations as a
+-- manual focus change and yank the cursor onto the wrong slot. Cleared shortly
+-- after, once the activation burst has settled.
+local function suppressFocusSync()
+  M.focusSyncSuppressed = true
+  if M.focusSyncTimer then M.focusSyncTimer:stop() end
+  M.focusSyncTimer = hs.timer.doAfter(0.4, function()
+    M.focusSyncSuppressed = false; M.focusSyncTimer = nil
+  end)
+end
+
 local function commit(changed, focusFlashOnly)
+  suppressFocusSync()
   if M.presetPanel then dismissPresetPanel() end   -- a composer move closes the preset panel
   if changed or layouts.minimized then
     applyComposition()
@@ -679,7 +708,10 @@ local function commit(changed, focusFlashOnly)
   drawAppSwitcher(cyList, src and src.name or nil, cyDisabled)
   -- Outline the new shape's slots on a shape change, or just the focused slot on
   -- a focus-only move (or when the caller forces it) — then fade.
-  flashSlotBounds(focusFlashOnly or not changed)
+  -- Skip the slot-outline flash while the spotlight is showing — its hole+rim
+  -- (drawn at the window's real frame) already marks the focus, and a second
+  -- slot-sized outline just doubles up.
+  if not (M.spotlightOn and not spotHidden) then flashSlotBounds(focusFlashOnly or not changed) end
   drawMinimap()
   if M.spotlightOn and not spotHidden then drawSpotlight() end
   persistState()
@@ -698,8 +730,42 @@ end
 -- ---------------------------------------------------------------------------
 -- Navigation
 -- ---------------------------------------------------------------------------
+-- When the REAL focused window belongs to no visible filled slot, the first arrow
+-- press should re-enter the composer at the cursor slot (just refocus it) rather
+-- than navigate/change geometry — so you land back on the slot the cursor was on
+-- before you wandered off to a non-slot app, not on a surprise layout change.
+-- commit(false) is the focus-only path: it refocuses slots[focus] and redraws the
+-- flash/spotlight without touching (v,h). Returns true when it consumed the press.
+-- Falls through (false) when the cursor slot is empty — nothing to return to, so
+-- normal nav applies.
+-- The visible filled slot nearest the cursor (min |i-focus|, ties toward the
+-- cursor's side first). nil when no visible slot holds a window.
+local function nearestFilledSlot()
+  local c, best, bd = cells(), nil, nil
+  for i = 1, 3 do
+    if c[i] and slots[i] then
+      local d = math.abs(i - focus)
+      if not bd or d < bd then best, bd = i, d end
+    end
+  end
+  return best
+end
+
+local function reenterFromNonSlot()
+  local fw = hs.window.focusedWindow()
+  local fa = fw and fw:application()
+  if not fa then return false end
+  if currentVisibleApps()[fa:name()] then return false end   -- already on a slot app
+  local target = nearestFilledSlot()
+  if not target then return false end   -- nothing to return to → let normal nav run
+  focus = target                        -- snap the cursor to the slot we're re-entering
+  commit(false)
+  return true
+end
+
 local function navLeft()
   if restoreIfMinimized() then return end
+  if reenterFromNonSlot() then return end
   local before = stateKey()
   if not moveFocus(-1) then
     h = math.min(h + 1, hLeftMax())
@@ -711,6 +777,7 @@ end
 
 local function navRight()
   if restoreIfMinimized() then return end
+  if reenterFromNonSlot() then return end
   local before = stateKey()
   if not moveFocus(1) then
     h = math.max(h - 1, hRightMax())
@@ -722,6 +789,7 @@ end
 
 local function navUp()
   if restoreIfMinimized() then return end
+  if reenterFromNonSlot() then return end
   local before = stateKey()
   if h ~= 0 then h = h + (h > 0 and -1 or 1)   -- recenter horizontally first
   else v = math.min(v + 1, 2) end              -- grow the middle
@@ -731,6 +799,7 @@ end
 
 local function navDown()
   if restoreIfMinimized() then return end
+  if reenterFromNonSlot() then return end
   local before = stateKey()
   if h ~= 0 then h = h + (h > 0 and -1 or 1)
   else v = math.max(v - 1, -1) end             -- shrink / remove the middle
@@ -766,6 +835,7 @@ end
 -- ---------------------------------------------------------------------------
 local function cycleSource(dir)
   if layouts.minimized then return end   -- in F19 mode, source cycling is a no-op
+  suppressFocusSync()
   local i = focus
   -- Only offer apps that actually have a window — cycling never launches, so a
   -- closed app would just show an empty slot. Apps in other slots are listed but
@@ -863,9 +933,9 @@ local function drawPresetPanel(sel)
   local oy = f.y + (f.h - H) / 2
 
   local els = { { type = "rectangle", action = "strokeAndFill",
-    fillColor = { white = 0.10, alpha = 0.92 },
-    strokeColor = { white = 1, alpha = 0.18 }, strokeWidth = 1,
-    shadow = { blurRadius = 32, color = { alpha = 0.55 }, offset = { h = -11, w = 0 } },
+    fillColor = theme.PANEL_FILL,
+    strokeColor = theme.HAIRLINE, strokeWidth = 1,
+    shadow = theme.SHADOW,
     frame = { x = MARGIN, y = MARGIN, w = panelW, h = panelH },
     roundedRectRadii = { xRadius = 20, yRadius = 20 } } }
 
@@ -1022,11 +1092,12 @@ end
 -- Start fresh: a clean thirds with all slots empty, so the user can populate it
 -- (via cycle / cmd-tab) and later save it as a preset through the normal flow.
 local function newLayout()
+  suppressFocusSync()
   v, h, focus = 0, 0, 1
   for i = 1, 3 do slots[i] = false end
   dismissPresetPanel()
   applyComposition()   -- empty slots → clean slate (hides everything)
-  flashSlotBounds()    -- show the fresh thirds even though all slots are empty
+  if not (M.spotlightOn and not spotHidden) then flashSlotBounds() end   -- skipped under spotlight
   drawMinimap()
   if M.spotlightOn and not spotHidden then drawSpotlight() end
   persistState()
@@ -1091,6 +1162,7 @@ end
 local function recall(id, silent)
   local p = savedPresets[id]
   if not p then hs.alert.show("Preset " .. id .. " is empty"); return end
+  suppressFocusSync()
   if M.presetPanel then dismissPresetPanel() end   -- close the panel on a successful switch
   v, h = p.v or 0, p.h or 0
   for i = 1, 3 do slots[i] = (p.sourceNames and resolveSource(p.sourceNames[i])) or false end
@@ -1102,7 +1174,7 @@ local function recall(id, silent)
   M.spotlightOn = p.spotlight or false
   spotHidden = false
   if M.spotlightOn then drawSpotlight() else clearSpotlight() end
-  flashSlotBounds()        -- always outline the applied layout, even if the shape is unchanged
+  if not (M.spotlightOn and not spotHidden) then flashSlotBounds() end   -- skipped under spotlight
   if not silent then drawMinimap() end
   if M.spotlightOn and not spotHidden then drawSpotlight() end
   persistState()
@@ -1217,12 +1289,46 @@ local function retileSlotForApp(_, appName)
   layouts.retileApp({ app = slots[i].app, rect = { c[1], 0, c[2], 1 }, stack = slots[i].stack })
 end
 
+-- A new window opened for a watched (catalog) app. If its app already owns a
+-- visible slot, re-tile that slot (the new window joins the stack). Otherwise, if
+-- there's an EMPTY visible slot, claim the nearest one for this app — snapping the
+-- newcomer in and making it that slot's source. Never evicts: with no empty
+-- visible slot the window is left floating. Standard primary-display windows only
+-- (so dialogs, pickers and the quick-terminal don't get grabbed).
+local function onWindowCreated(win, appName)
+  if layouts.minimized then return end
+  if slotForApp(appName) then retileSlotForApp(nil, appName); return end
+  if not (win and win:isStandard() and wm.isOnPrimary(win)) then return end
+  local src
+  for _, s in ipairs(sources) do if s.app == appName then src = s; break end end
+  if not src then return end
+  local empties = {}
+  for k = 1, 3 do if cells()[k] and not slots[k] then empties[#empties + 1] = k end end
+  if #empties == 0 then return end          -- no room → leave it floating, never evict
+  local f = hs.screen.primaryScreen():frame()
+  local wf = win:frame()
+  local wx = (wf.x - f.x + wf.w / 2) / f.w   -- new window's fractional center x
+  local best, bd
+  for _, k in ipairs(empties) do
+    local cl = cells()[k]
+    local d = math.abs((cl[1] + cl[2] / 2) - wx)
+    if not bd or d < bd then best, bd = k, d end
+  end
+  slots[best] = src
+  applyComposition()
+  persistState()
+end
+
 local watchedApps = {}
 for _, s in ipairs(sources) do watchedApps[#watchedApps + 1] = s.app end
 M.newWindowFilter = hs.window.filter.new(watchedApps)
-M.newWindowFilter:subscribe(
-  { hs.window.filter.windowCreated, hs.window.filter.windowDestroyed },
-  retileSlotForApp)
+M.newWindowFilter:subscribe(hs.window.filter.windowCreated, onWindowCreated)
+M.newWindowFilter:subscribe(hs.window.filter.windowDestroyed, retileSlotForApp)
+-- While focus mode is on, follow the focused window's live frame as it's moved or
+-- resized (mouse or WM hotkeys) so the spotlight hole tracks it in real time.
+M.newWindowFilter:subscribe(hs.window.filter.windowMoved, function()
+  if M.spotlightOn and not spotHidden then drawSpotlight() end
+end)
 
 -- Pin/unpin the minimap (stays up until 'm' again or an arrow nav un-pins it).
 hs.hotkey.bind(mod, "m", toggleMinimap)
@@ -1238,6 +1344,7 @@ hs.hotkey.bind(mod, "f", toggleSpotlight)
 -- activating a non-slot app is ignored (the cursor stays put).
 M.focusSyncWatcher = hs.application.watcher.new(function(appName, eventType)
   if eventType ~= hs.application.watcher.activated then return end
+  if M.focusSyncSuppressed then return end   -- composer is mid-move; ignore its activations
   local slot
   for i = 1, 3 do
     if cells()[i] and slots[i] and slots[i].app == appName then slot = i; break end

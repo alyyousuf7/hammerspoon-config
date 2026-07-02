@@ -3,6 +3,12 @@
 -- the menubar); click it to open the affected service's status page. When a
 -- service recovers, show a "back up · was down for Xm · recovered at HH:MM PM"
 -- pill that stays until dismissed (× button).
+--
+-- Rendering/placement is delegated to config.notifier (the shared HUD), which
+-- stacks this module's pills together with any other tool's so they never
+-- overlap. This file owns only the polling, state, and persistence.
+
+local hud = require("config.notifier")
 
 -- ============================================================================
 -- CONFIG
@@ -45,6 +51,17 @@ local recoveredColor = indicators.none
 
 local order = { none = 0, maintenance = 1, minor = 2, major = 3, critical = 4 }
 
+-- Alphabetical rank per service (A=1). Folded into the pill `sort` weight so
+-- that, among equally-severe outages, pills order by name — matching the
+-- pre-HUD behavior, where the notifier otherwise breaks ties by registration.
+local alphaRank = {}
+do
+  local names = {}
+  for _, s in ipairs(services) do table.insert(names, s.name) end
+  table.sort(names)
+  for i, n in ipairs(names) do alphaRank[n] = i end
+end
+
 -- ============================================================================
 -- STATE
 -- ============================================================================
@@ -67,16 +84,19 @@ end
 -- ----------------------------------------------------------------------------
 local SETTINGS_KEY = "serviceStatus.persisted.v1"
 local STALE_DOWN_SECS = 24 * 3600   -- drop persisted outage if older than this
+local SNOOZE_SECS = 30 * 60         -- × on an outage hides it for this long
 
 local function saveState()
   local snap = {}
   for _, s in ipairs(services) do
     local st = state[s.name]
     snap[s.name] = {
-      indicator   = st.indicator,
-      description = st.description,
-      downSince   = st.downSince,
-      recovered   = st.recovered,
+      indicator    = st.indicator,
+      description  = st.description,
+      downSince    = st.downSince,
+      recovered    = st.recovered,
+      snoozedUntil = st.snoozedUntil,
+      snoozedOrder = st.snoozedOrder,
     }
   end
   hs.settings.set(SETTINGS_KEY, snap)
@@ -92,194 +112,81 @@ local function loadState()
       local st = state[s.name]
       -- Drop a stale outage entirely; the next poll authoritatively sets state.
       if saved.downSince and (now - saved.downSince) > STALE_DOWN_SECS then
-        saved.indicator   = "none"
-        saved.description = "All Systems Operational"
-        saved.downSince   = nil
+        saved.indicator    = "none"
+        saved.description  = "All Systems Operational"
+        saved.downSince    = nil
+        saved.snoozedUntil = nil
+        saved.snoozedOrder = nil
       end
       if saved.indicator   then st.indicator   = saved.indicator   end
       if saved.description then st.description = saved.description end
       if saved.downSince   then st.downSince   = saved.downSince   end
       if type(saved.recovered) == "table" then st.recovered = saved.recovered end
+      if saved.snoozedUntil then st.snoozedUntil = saved.snoozedUntil end
+      if saved.snoozedOrder then st.snoozedOrder = saved.snoozedOrder end
     end
   end
 end
 
 loadState()
 
-local function fmtDuration(secs)
-  if secs < 60 then return secs .. "s" end
-  if secs < 3600 then
-    local m = math.floor(secs / 60)
-    local s = secs % 60
-    if s == 0 then return m .. "m" end
-    return m .. "m " .. s .. "s"
-  end
-  if secs < 86400 then
-    local h = math.floor(secs / 3600)
-    local m = math.floor((secs % 3600) / 60)
-    if m == 0 then return h .. "h" end
-    return h .. "h " .. m .. "m"
-  end
-  local d = math.floor(secs / 86400)
-  local h = math.floor((secs % 86400) / 3600)
-  if h == 0 then return d .. "d" end
-  return d .. "d " .. h .. "h"
-end
-
-local function relativeTime(ts)
-  if not ts then return "never" end
-  local diff = os.time() - ts
-  if diff < 5 then return "just now" end
-  return fmtDuration(diff) .. " ago"
-end
-
 -- ============================================================================
--- MENUBAR-CENTER PILL
+-- HUD NOTICES
 -- ----------------------------------------------------------------------------
--- macOS doesn't allow real menubar items in the middle, so this is a canvas
--- overlay positioned at top-center at the menubar's y-coordinate.
+-- One notice per service. `build` reads live state and returns the pill content
+-- (or nil when the service is healthy with no undismissed recovery notice).
+-- The HUD calls build on every render, so relative-time text stays fresh.
 -- ============================================================================
 
--- pills[serviceName] -> hs.canvas
-local pills = {}
-
--- Build the ordered list of pills to show. Down services first (worst first),
--- then undismissed recovery notices (most-recent recovery first).
-local function pillTargets()
-  local downs, recs = {}, {}
-  for _, s in ipairs(services) do
-    local st = state[s.name]
-    if order[st.indicator] > 0 then
-      table.insert(downs, { svc = s, kind = "down", ind = st.indicator })
-    elseif st.recovered then
-      table.insert(recs, { svc = s, kind = "recovered", ind = "none", recoveredAt = st.recovered.recoveredAt })
-    end
-  end
-  table.sort(downs, function(a, b)
-    if order[a.ind] ~= order[b.ind] then return order[a.ind] > order[b.ind] end
-    return a.svc.name < b.svc.name
-  end)
-  table.sort(recs, function(a, b) return a.recoveredAt > b.recoveredAt end)
-  for _, r in ipairs(recs) do table.insert(downs, r) end
-  return downs
-end
-
-local function pillContent(target)
-  local svc, kind, ind = target.svc, target.kind, target.ind
+local function buildContent(s)
+  local st = state[s.name]
   local now = os.time()
-  if kind == "down" then
-    local st = state[svc.name]
-    local downFor = st.downSince and fmtDuration(now - st.downSince) or "?"
+
+  if order[st.indicator] > 0 then
+    -- Snoozed (× pressed): hide until the deadline, then the HUD's refresh timer
+    -- brings it back if still down. A fresh or worse outage clears the snooze
+    -- (see applyResult), so escalations always resurface.
+    if st.snoozedUntil and now < st.snoozedUntil then return nil end
+    local downFor = st.downSince and hud.fmtDuration(now - st.downSince) or "?"
     return {
-      color    = indicators[ind],
-      mainText = string.format("⚠  %s: %s", svc.name, st.description),
-      subText  = string.format("down for %s · updated %s", downFor, relativeTime(st.updatedAt)),
-      hasClose = false,
+      color    = indicators[st.indicator],
+      icon     = "⚠",
+      mainText = string.format("%s: %s", s.name, st.description),
+      subText  = string.format("down for %s · updated %s", downFor, hud.relativeTime(st.updatedAt)),
+      hasClose = true,
+      -- Worst outage nearest the top; equal severity ordered by name (alphaRank).
+      sort     = 2e12 + order[st.indicator] * 1000 - alphaRank[s.name],
+      onClick  = function() hs.urlevent.openURL(s.page) end,
+      onClose  = function()
+        st.snoozedUntil = os.time() + SNOOZE_SECS
+        st.snoozedOrder = order[st.indicator]   -- so a worse severity un-snoozes
+        saveState()
+      end,
     }
   end
-  local r = state[svc.name].recovered
-  local wasDown = (r.downSince and r.recoveredAt) and fmtDuration(r.recoveredAt - r.downSince) or "?"
-  local function clock(ts)
-    if not ts then return "?" end
-    local s = os.date("%I:%M %p", ts)
-    return (s:sub(1,1) == "0") and s:sub(2) or s
+
+  if st.recovered then
+    local r = st.recovered
+    local wasDown = (r.downSince and r.recoveredAt) and hud.fmtDuration(r.recoveredAt - r.downSince) or "?"
+    return {
+      color    = recoveredColor,
+      icon     = "✓",
+      mainText = string.format("%s is back up", s.name),
+      subText  = string.format("was down for %s between %s – %s", wasDown, hud.clock(r.downSince), hud.clock(r.recoveredAt)),
+      hasClose = true,
+      -- Below all outages; most-recent recovery highest.
+      sort     = 1e12 + (r.recoveredAt or 0),
+      onClick  = function() hs.urlevent.openURL(s.page) end,
+      onClose  = function() st.recovered = nil; saveState() end,
+    }
   end
-  return {
-    color    = recoveredColor,
-    mainText = string.format("✓  %s is back up", svc.name),
-    subText  = string.format("was down for %s between %s – %s", wasDown, clock(r.downSince), clock(r.recoveredAt)),
-    hasClose = true,
-  }
+
+  return nil
 end
 
-local function measureWidth(text, size)
-  local ok, s = pcall(function()
-    return hs.drawing.getTextDrawingSize(text, { font = { name = "Helvetica", size = size } })
-  end)
-  if ok and s and s.w then return s.w end
-  return #text * size * 0.6
+for _, s in ipairs(services) do
+  hud.register("service:" .. s.name, { zone = "top", build = function() return buildContent(s) end })
 end
-
-local function buildPill(content, x, y, w, h)
-  local color = content.color
-  local canvas = hs.canvas.new({ x = x, y = y, w = w, h = h })
-  canvas:level(hs.canvas.windowLevels.popUpMenu)
-  canvas:behavior({ "canJoinAllSpaces", "stationary" })
-
-  local elements = {
-    { type = "rectangle", action = "strokeAndFill",
-      fillColor   = { white = 0.08, alpha = 0.85 },
-      strokeColor = { red = color.red, green = color.green, blue = color.blue, alpha = 0.5 },
-      strokeWidth = 1,
-      frame = { x = 0.5, y = 0.5, w = w - 1, h = h - 1 },
-      roundedRectRadii = { xRadius = 8, yRadius = 8 } },
-    { type = "text", text = content.mainText,
-      textColor = { red = color.red, green = color.green, blue = color.blue, alpha = 1 },
-      textSize = 13, textAlignment = "center",
-      frame = { x = 12, y = 5, w = w - 24, h = 18 } },
-    { type = "text", text = content.subText,
-      textColor = { white = 0.55, alpha = 1 },
-      textSize = 11, textAlignment = "center",
-      frame = { x = 12, y = 24, w = w - 24, h = 16 } },
-  }
-  if content.hasClose then
-    table.insert(elements, {
-      type = "text", id = "close", text = "×",
-      textColor = { white = 0.75, alpha = 1 },
-      textSize = 18, textAlignment = "center",
-      frame = { x = w - 28, y = 8, w = 22, h = 26 },
-      trackMouseUp = true,
-    })
-  end
-  canvas:replaceElements(elements)
-  canvas:clickActivating(false)
-  return canvas
-end
-
-local function renderCenterPill()
-  local targets = pillTargets()
-  -- Primary (menu-bar) screen, not mainScreen — mainScreen follows the focused
-  -- window, so the pill would jump to a secondary display (e.g. iPad) when a
-  -- window there gains focus.
-  local screen = hs.screen.primaryScreen():fullFrame()
-  local h, gap = 44, 4
-  local minW, maxW = 240, math.min(520, screen.w - 40)
-  local hPad = 24      -- text inset on each side combined
-  local closePad = 24  -- extra room for × button
-
-  local seen = {}
-  for i, t in ipairs(targets) do
-    local content = pillContent(t)
-    local textW = math.max(measureWidth(content.mainText, 13),
-                           measureWidth(content.subText, 11))
-    local w = math.ceil(textW) + hPad + (content.hasClose and closePad or 0)
-    if w < minW then w = minW end
-    if w > maxW then w = maxW end
-    local x = screen.x + (screen.w - w) / 2
-    local y = screen.y + gap + (i - 1) * (h + gap)
-    if pills[t.svc.name] then pills[t.svc.name]:delete() end
-    local canvas = buildPill(content, x, y, w, h)
-    canvas:mouseCallback(function(_, evt, id)
-      if evt ~= "mouseUp" then return end
-      if id == "close" then
-        state[t.svc.name].recovered = nil
-        saveState()
-        renderCenterPill()
-      else
-        hs.urlevent.openURL(t.svc.page)
-      end
-    end)
-    canvas:canvasMouseEvents(true, true)
-    canvas:show()
-    pills[t.svc.name] = canvas
-    seen[t.svc.name] = true
-  end
-  -- Drop pills for services that no longer have a notice.
-  for name, canvas in pairs(pills) do
-    if not seen[name] then canvas:delete(); pills[name] = nil end
-  end
-end
-
 
 -- ============================================================================
 -- POLLING
@@ -296,7 +203,17 @@ local function applyResult(s, indicator, description)
   st.updatedAt   = now
 
   if nowDown then
-    if not st.downSince then st.downSince = now end
+    if not st.downSince then
+      st.downSince = now
+      -- Fresh outage episode: clear any leftover snooze from a previous one.
+      st.snoozedUntil = nil
+      st.snoozedOrder = nil
+    end
+    -- Escalation un-snoozes: a worse severity than when snoozed resurfaces now.
+    if st.snoozedUntil and st.snoozedOrder and order[indicator] > st.snoozedOrder then
+      st.snoozedUntil = nil
+      st.snoozedOrder = nil
+    end
     -- New outage cancels any prior undismissed recovery notice for this svc.
     st.recovered = nil
   else
@@ -309,6 +226,9 @@ local function applyResult(s, indicator, description)
       }
     end
     st.downSince = nil
+    -- Recovered: drop the snooze so a future outage isn't pre-silenced.
+    st.snoozedUntil = nil
+    st.snoozedOrder = nil
   end
 end
 
@@ -322,20 +242,18 @@ local function poll()
       if not indicator then return end
       applyResult(s, indicator, description)
       saveState()
-      renderCenterPill()
+      hud.refresh()
     end)
   end
 end
 
 -- Globals: top-level locals get reclaimed once `require` returns (see comment
 -- in init.lua about configWatcher). hs.timer / hs.caffeinate.watcher need a
--- live reference to keep firing.
+-- live reference to keep firing. (Relative-time text is refreshed by the HUD's
+-- own central timer, so this module no longer needs its own refresh timer.)
 serviceStatusPollTimer    = hs.timer.new(pollInterval, poll)
 serviceStatusPollTimer:start()
 poll()
-
--- Re-render every 5s so "down for Xm Ys" / "recovered Xm ago" stays fresh.
-serviceStatusRefreshTimer = hs.timer.doEvery(5, renderCenterPill)
 
 -- Timers pause during system sleep, so re-poll immediately on wake.
 serviceStatusWakeWatcher = hs.caffeinate.watcher.new(function(event)

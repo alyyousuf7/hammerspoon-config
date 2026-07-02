@@ -264,6 +264,11 @@ local otcTask = nil
 
 local function startHelper()
   if otcTask and otcTask:isRunning() then return end
+  -- Reap any helper orphaned by a previous load. Hammerspoon's config reload
+  -- tears down the Lua state WITHOUT terminating hs.task children, so each reload
+  -- would otherwise leave the old poller running — and they pile up (17 once seen,
+  -- each still polling MySQL). Kill the binary by its path before launching anew.
+  hs.execute("pkill -f '" .. OTC_BIN .. "' 2>/dev/null")
   stdoutBuf = ""
   otcTask = hs.task.new(OTC_BIN, function(_exit, _out, _err)
     -- Exit callback: helper died. Don't auto-restart in a tight loop — let
